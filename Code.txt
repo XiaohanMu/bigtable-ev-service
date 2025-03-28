@@ -1,0 +1,123 @@
+Set Up Bigtable:
+sudo apt update && sudo apt install python3-pip python3-venv -y
+python3 -m venv .venv
+source .venv/bin/activate
+pip install flask google-cloud-bigtable pandas
+
+gcloud services enable bigtable.googleapis.com
+
+gcloud bigtable instances create ev-bigtable \
+  --cluster=ev-bigtable-cluster \
+  --cluster-zone=us-central1-b \
+  --display-name="EV Bigtable" \
+  --instance-type=DEVELOPMENT
+
+gcloud bigtable tables create ev-population \
+  --instance=ev-bigtable \
+  --column-families=ev_info
+
+
+script for loading data into Bigtable:
+wget https://your-dataset-url/Electric_Vehicle_Population_Data.csv
+
+load_data.py:
+import pandas as pd
+from google.cloud import bigtable
+from google.cloud.bigtable import column_family
+
+client = bigtable.Client(admin=True)
+instance = client.instance("ev-bigtable")
+table = instance.table("ev-population")
+
+df = pd.read_csv("Electric_Vehicle_Population_Data.csv")
+df = df.fillna("")  # avoid NaNs
+
+for _, row in df.iterrows():
+    row_key = str(row["DOL Vehicle ID"]).encode()
+    bt_row = table.direct_row(row_key)
+    bt_row.set_cell("ev_info", "make", row["Make"])
+    bt_row.set_cell("ev_info", "model", row["Model"])
+    bt_row.set_cell("ev_info", "model year", str(row["Model Year"]))
+    bt_row.set_cell("ev_info", "electric range", str(row["Electric Range"]))
+    bt_row.set_cell("ev_info", "city", row["City"])
+    bt_row.set_cell("ev_info", "county", row["County"])
+    bt_row.commit()
+
+
+export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project)
+python load_data.py
+
+
+
+script for querying, updating, and deleting records:
+
+app.py
+from flask import Flask
+from google.cloud import bigtable
+import os
+
+app = Flask(__name__)
+client = bigtable.Client(project=os.environ['GOOGLE_CLOUD_PROJECT'], admin=True)
+instance = client.instance("ev-bigtable")
+table = instance.table("ev-population")
+
+@app.route("/rows")
+def total_rows():
+    count = sum(1 for _ in table.read_rows())
+    return str(count)
+
+@app.route("/Best-BMW")
+def best_bmw():
+    count = 0
+    for row in table.read_rows():
+        cells = row.cells["ev_info"]
+        make = cells.get("make", [None])[0].value.decode().upper()
+        range_val = cells.get("electric range", [None])[0].value.decode()
+        if make == "BMW":
+            try:
+                if int(range_val) > 100:
+                    count += 1
+            except:
+                continue
+    return str(count)
+
+@app.route("/tesla-owners")
+def tesla_owners():
+    count = 0
+    for row in table.read_rows():
+        cells = row.cells["ev_info"]
+        make = cells.get("make", [None])[0].value.decode().upper()
+        city = cells.get("city", [None])[0].value.decode().upper()
+        if make == "TESLA" and city == "SEATTLE":
+            count += 1
+    return str(count)
+
+@app.route("/update")
+def update():
+    row_key = b"257246118"
+    bt_row = table.direct_row(row_key)
+    bt_row.set_cell("ev_info", "electric range", "200")
+    bt_row.commit()
+    return "Success"
+
+@app.route("/delete")
+def delete_old_models():
+    count = 0
+    to_delete = []
+    for row in table.read_rows():
+        cells = row.cells["ev_info"]
+        try:
+            year = int(cells.get("model year", [None])[0].value.decode())
+            if year < 2014:
+                to_delete.append(row.row_key)
+            else:
+                count += 1
+        except:
+            count += 1
+    for key in to_delete:
+        table.mutate_rows([table.row(key).delete()])
+    return str(count)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
