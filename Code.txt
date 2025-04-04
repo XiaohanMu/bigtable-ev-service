@@ -1,81 +1,114 @@
-Set Up Bigtable:
+# Step 1: Set up Python environment
 sudo apt update && sudo apt install python3-pip python3-venv -y
 python3 -m venv .venv
 source .venv/bin/activate
 pip install flask google-cloud-bigtable pandas
 
+# Step 2: Enable Bigtable API
 gcloud services enable bigtable.googleapis.com
 
+# Step 3: Create Bigtable instance
 gcloud bigtable instances create ev-bigtable \
   --cluster=ev-bigtable-cluster \
   --cluster-zone=us-central1-b \
   --display-name="EV Bigtable" \
   --instance-type=DEVELOPMENT
 
+# Step 4: Create table and column family
 gcloud bigtable tables create ev-population \
   --instance=ev-bigtable \
   --column-families=ev_info
 
+________________________________________________________________________________
 
-script for loading data into Bigtable:
-wget https://your-dataset-url/Electric_Vehicle_Population_Data.csv
-
-load_data.py:
+#load_data.py
+import os
 import pandas as pd
 from google.cloud import bigtable
-from google.cloud.bigtable import column_family
 
-client = bigtable.Client(admin=True)
+# Connect to Bigtable
+project_id = os.environ["GOOGLE_CLOUD_PROJECT"]
+client = bigtable.Client(project=project_id, admin=True)
 instance = client.instance("ev-bigtable")
 table = instance.table("ev-population")
 
+# Load and clean CSV
 df = pd.read_csv("Electric_Vehicle_Population_Data.csv")
-df = df.fillna("")  # avoid NaNs
 
-for _, row in df.iterrows():
-    row_key = str(row["DOL Vehicle ID"]).encode()
-    bt_row = table.direct_row(row_key)
-    bt_row.set_cell("ev_info", "make", row["Make"])
-    bt_row.set_cell("ev_info", "model", row["Model"])
-    bt_row.set_cell("ev_info", "model year", str(row["Model Year"]))
-    bt_row.set_cell("ev_info", "electric range", str(row["Electric Range"]))
-    bt_row.set_cell("ev_info", "city", row["City"])
-    bt_row.set_cell("ev_info", "county", row["County"])
-    bt_row.commit()
+df = df.dropna(subset=["DOL Vehicle ID"])
+df["DOL Vehicle ID"] = df["DOL Vehicle ID"].astype(str).str.strip()
+df = df[df["DOL Vehicle ID"].str.isnumeric()]
+df = df.drop_duplicates(subset=["DOL Vehicle ID"])
+df = df.fillna("")
+
+print(f"Uploading {len(df)} rows to Bigtable...")
+
+for i, row in df.iterrows():
+    try:
+        row_key = row["DOL Vehicle ID"].encode()
+        bt_row = table.direct_row(row_key)
+
+        bt_row.set_cell("ev_info", "make", row["Make"])
+        bt_row.set_cell("ev_info", "model", row["Model"])
+        bt_row.set_cell("ev_info", "model year", str(row["Model Year"]))
+        bt_row.set_cell("ev_info", "electric range", str(row["Electric Range"]))
+        bt_row.set_cell("ev_info", "city", row["City"])
+        bt_row.set_cell("ev_info", "county", row["County"])
+
+        bt_row.commit()
+
+        if i % 1000 == 0:
+            print(f"Loaded {i} rows...")
+
+    except Exception as e:
+        print(f"Skipped row {i} due to: {e}")
+
+print("All data loaded.")
 
 
+#run load_data.py
 export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project)
 python load_data.py
 
+________________________________________________________________________________
 
-
-script for querying, updating, and deleting records:
-
-app.py
+#app.py
 from flask import Flask
 from google.cloud import bigtable
 import os
 
 app = Flask(__name__)
-client = bigtable.Client(project=os.environ['GOOGLE_CLOUD_PROJECT'], admin=True)
-instance = client.instance("ev-bigtable")
-table = instance.table("ev-population")
+
+# Connect to Bigtable
+project_id = os.environ["GOOGLE_CLOUD_PROJECT"]
+instance_id = "ev-bigtable"
+table_id = "ev-population"
+
+client = bigtable.Client(project=project_id, admin=True)
+instance = client.instance(instance_id)
+table = instance.table(table_id)
 
 @app.route("/rows")
 def total_rows():
-    count = sum(1 for _ in table.read_rows())
-    return str(count)
+    try:
+        count = sum(1 for _ in table.read_rows())
+        return str(count)
+    except Exception as e:
+        return f"Error: {e}", 500
 
 @app.route("/Best-BMW")
 def best_bmw():
     count = 0
     for row in table.read_rows():
-        cells = row.cells["ev_info"]
-        make = cells.get("make", [None])[0].value.decode().upper()
-        range_val = cells.get("electric range", [None])[0].value.decode()
-        if make == "BMW":
+        cells = row.cells.get("ev_info", {})
+        make_cell = cells.get("make", [None])[0]
+        range_cell = cells.get("electric range", [None])[0]
+
+        if make_cell and range_cell:
+            make = make_cell.value.decode().strip().upper()
             try:
-                if int(range_val) > 100:
+                range_val = int(float(range_cell.value.decode().strip()))
+                if make == "BMW" and range_val > 100:
                     count += 1
             except:
                 continue
@@ -85,39 +118,49 @@ def best_bmw():
 def tesla_owners():
     count = 0
     for row in table.read_rows():
-        cells = row.cells["ev_info"]
-        make = cells.get("make", [None])[0].value.decode().upper()
-        city = cells.get("city", [None])[0].value.decode().upper()
-        if make == "TESLA" and city == "SEATTLE":
-            count += 1
+        cells = row.cells.get("ev_info", {})
+        make_cell = cells.get("make", [None])[0]
+        city_cell = cells.get("city", [None])[0]
+
+        if make_cell and city_cell:
+            make = make_cell.value.decode().strip().upper()
+            city = city_cell.value.decode().strip().upper()
+            if make == "TESLA" and city == "SEATTLE":
+                count += 1
     return str(count)
 
 @app.route("/update")
 def update():
-    row_key = b"257246118"
-    bt_row = table.direct_row(row_key)
-    bt_row.set_cell("ev_info", "electric range", "200")
-    bt_row.commit()
-    return "Success"
+    try:
+        row_key = b"257246118"
+        bt_row = table.direct_row(row_key)
+        bt_row.set_cell("ev_info", "electric range", "200")
+        bt_row.commit()
+        return "Success"
+    except Exception as e:
+        return f"Error: {e}", 500
 
 @app.route("/delete")
 def delete_old_models():
     count = 0
-    to_delete = []
     for row in table.read_rows():
-        cells = row.cells["ev_info"]
-        try:
-            year = int(cells.get("model year", [None])[0].value.decode())
-            if year < 2014:
-                to_delete.append(row.row_key)
-            else:
-                count += 1
-        except:
-            count += 1
-    for key in to_delete:
-        table.mutate_rows([table.row(key).delete()])
+        cells = row.cells.get("ev_info", {})
+        year_cell = cells.get("model year", [None])[0]
+
+        if year_cell:
+            try:
+                year = int(year_cell.value.decode().strip())
+                if year < 2014:
+                    table.direct_row(row.row_key).delete().commit()
+                    continue
+            except:
+                pass
+        count += 1
     return str(count)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=80)
 
+
+#run flask app
+python app.py
